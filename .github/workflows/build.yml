@@ -37,8 +37,8 @@ jobs:
           yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null
           /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
           echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
-      - name: Install NDK, CMake and build-tools
-        run: sdkmanager --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
+      - name: Add sdkmanager to PATH
+        run: echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       # The whole build is driven by Gradle via the committed wrapper: AGP produces the control
       # daemon's dex and builds the native interceptors through externalNativeBuild (CMake), whose
