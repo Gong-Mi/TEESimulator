@@ -29,7 +29,14 @@ jobs:
           sudo apt-get install -y ninja-build golang-go clang libclang-dev zip
 
       - name: Set up the Android SDK and NDK
-        uses: android-actions/setup-android@v3
+        # upstream uses android-actions/setup-android@v3, which now hard-fails: it forces
+        # `sdkmanager tools`, and the `tools` package was removed from the repository
+        # (cmdline-tools superseded it). The runner image already ships a preinstalled SDK
+        # with cmdline-tools; accept licenses and install what the build needs directly.
+        run: |
+          yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null
+          /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
+          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
       - name: Install NDK, CMake and build-tools
         run: sdkmanager --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
 
