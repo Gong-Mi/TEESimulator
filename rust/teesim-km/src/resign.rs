@@ -53,6 +53,88 @@ const RSA_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.8
 const ATTESTATION_EXT_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
 
+/// Normalize non-canonical BOOLEAN encodings in a DER structure to what the strict `der`
+/// parser accepts. Real TEEs occasionally emit BER-flavoured booleans — any nonzero byte
+/// where DER demands `0xff` (observed from MTK MITEE leaves, whose 671-byte attestation
+/// leaf carries `BOOLEAN 0x01`) — and the strict parser rejects the whole certificate
+/// over that single byte, so patch mode cannot re-root the key and it keeps its real
+/// chain. Walks the TLV structure and rewrites BOOLEAN contents only; a span that does
+/// not parse as definite-length DER is returned untouched, so any other malformation
+/// still surfaces as the strict parser's own error.
+fn normalize_der_booleans(der: &[u8]) -> Vec<u8> {
+    let mut out = der.to_vec();
+    let mut off = 0;
+    while off < der.len() {
+        let used = normalize_span(&der[off..], &mut out[off..]);
+        if used == 0 {
+            break; // not definite-length DER; leave the remainder untouched
+        }
+        off += used;
+    }
+    out
+}
+
+/// Normalize one TLV element (and, recursively, its children) from `span`, mirroring any
+/// rewrite into `out` at the same offsets. Returns the bytes the element occupies, or 0
+/// when the structure is not definite-length DER and must be left alone.
+fn normalize_span(span: &[u8], out: &mut [u8]) -> usize {
+    let Some((&tag, rest)) = span.split_first() else { return 0 };
+    // High-tag-number form: the tag number continues in subsequent bytes, high bit set.
+    let mut rest = rest;
+    let mut header = 1;
+    if tag & 0x1f == 0x1f {
+        loop {
+            let Some((&b, tail)) = rest.split_first() else { return 0 };
+            rest = tail;
+            header += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    // Definite length, short or long form; `0x80` (indefinite) is not DER.
+    let Some((&len_byte, body)) = rest.split_first() else { return 0 };
+    header += 1;
+    let content_len = if len_byte < 0x80 {
+        len_byte as usize
+    } else if len_byte < 0xff {
+        let n = (len_byte & 0x7f) as usize;
+        if n == 0 || n > body.len() || n > 4 {
+            return 0;
+        }
+        let mut len = 0usize;
+        for &b in &body[..n] {
+            len = (len << 8) | b as usize;
+        }
+        header += n;
+        len
+    } else {
+        return 0;
+    };
+    if header + content_len > span.len() {
+        return 0; // truncated content: leave untouched
+    }
+    let content = &span[header..header + content_len];
+    if tag == 0x01 {
+        // BOOLEAN: DER allows exactly one content byte, 0x00 or 0xff (BER permits any
+        // nonzero for TRUE). Re-encode any other value as canonical TRUE.
+        if content_len == 1 && content[0] != 0x00 && content[0] != 0xff {
+            out[header] = 0xff;
+        }
+    } else if tag & 0x20 != 0 {
+        // Constructed: recurse into the children.
+        let mut off = 0;
+        while off < content.len() {
+            let used = normalize_span(&content[off..], &mut out[header + off..]);
+            if used == 0 {
+                break;
+            }
+            off += used;
+        }
+    }
+    header + content_len
+}
+
 /// A short local error, formatting any Debug source.
 fn wrap<E: core::fmt::Debug>(ctx: &'static str) -> impl Fn(E) -> OpError {
     move |e| OpError { code: ERR, msg: format!("patch: {ctx}: {e:?}") }
@@ -67,7 +149,22 @@ impl Ta {
     /// trust. Returns the new chain `[patched leaf, keybox chain…]`.
     pub fn patch_attestation(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
         log::info!("teesim_km: patch_attestation input leaf: {}", describe_cert(leaf));
-        let cert = Certificate::from_der(leaf).map_err(wrap("parse real leaf"))?;
+        // Real TEE leaves are occasionally non-canonical (MTK MITEE emits BER-flavoured
+        // booleans), which the strict parser rejects wholesale. Retry once over a
+        // normalized copy so a single non-canonical byte does not strand the key on its
+        // real chain; a normalized copy that still fails is a genuinely malformed leaf.
+        let cert = match Certificate::from_der(leaf) {
+            Ok(c) => c,
+            Err(strict_err) => match Certificate::from_der(&normalize_der_booleans(leaf)) {
+                Ok(c) => {
+                    log::info!(
+                        "teesim_km: patch_attestation: non-canonical leaf ({strict_err}); BOOLEAN(s) normalized"
+                    );
+                    c
+                }
+                Err(e) => return Err(wrap("parse real leaf")(e)),
+            },
+        };
         let mut tbs = cert.tbs_certificate;
 
         // Sign with the keybox key matching the attested key's algorithm; batch() falls back to the
